@@ -1,0 +1,138 @@
+name: Build sing-box iOS IPA (unsigned)
+
+# 独立仓库版：无需 fork，直接 clone SagerNet/sing-box 官方源码构建。
+# 产出未签名 IPA（ad-hoc 签名），下载后用 Sideloadly / 爱思助手重签侧载。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "sing-box 版本号（写入 libbox 与应用，如 1.15.0-alpha.12）"
+        required: true
+        default: "1.15.0-alpha.12"
+      singbox_ref:
+        description: "sing-box 仓库的分支/tag"
+        required: true
+        default: "testing"
+      apple_ref:
+        description: "sing-box-for-apple 的分支/tag（留空 = 使用子模块锁定的配套 commit）"
+        required: false
+        default: ""
+      runner:
+        description: "GitHub runner 标签（xcode-27 与官方一致；不可用时改 macos-26）"
+        required: true
+        default: "xcode-27"
+
+jobs:
+  build-ipa:
+    name: Build unsigned SFI IPA (ios-arm64)
+    runs-on: ${{ inputs.runner || 'xcode-27' }}
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout sing-box (with Apple client submodule)
+        uses: actions/checkout@v5
+        with:
+          repository: SagerNet/sing-box
+          ref: ${{ inputs.singbox_ref || 'testing' }}
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Override Apple client ref
+        if: ${{ inputs.apple_ref != '' }}
+        run: |
+          git -C clients/apple checkout "${{ inputs.apple_ref }}"
+          git -C clients/apple submodule update --init --recursive
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.8
+          cache: false
+
+      # Go 标准库在 GOOS=ios 下不启用 ARM64 硬件加密指令，官方提供补丁修正。
+      # 仅 ios/tvOS 目标需要。详见 sing-box issue #4486。
+      - name: Patch Go for iOS
+        run: .github/patch_go_for_ios.sh
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-ipa-${{ hashFiles('go.sum') }}
+          restore-keys: go-mod-ipa-
+
+      - name: Cache Go build
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/go-build
+          key: libbox-go-build-ios-1.26.8-${{ hashFiles('go.sum') }}
+          restore-keys: libbox-go-build-ios-1.26.8-
+
+      - name: Set version tag
+        run: git tag "v${{ inputs.version }}" -f
+
+      - name: Build Libbox.xcframework (ios/arm64)
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          make lib_install
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          go run ./cmd/internal/build_libbox -target apple -platform ios/arm64
+          rm -rf clients/apple/Libbox.xcframework
+          cp -R Libbox.xcframework clients/apple/Libbox.xcframework
+
+      - name: Sync Apple project version
+        run: go run -v ./cmd/internal/update_apple_version --ci
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcode-select -p
+
+      - name: Build SFI app (unsigned)
+        working-directory: clients/apple
+        env:
+          DISABLE_SWIFTLINT: "1"
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -skipPackagePluginValidation \
+            -scheme SFI \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/dd \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            ENABLE_BITCODE=NO
+
+      - name: Package unsigned IPA
+        working-directory: clients/apple
+        run: |
+          APP="build/dd/Build/Products/Release-iphoneos/sing-box.app"
+          if [ ! -d "$APP" ]; then
+            echo "ERROR: app bundle not found at $APP"
+            find build/dd/Build/Products -maxdepth 3 || true
+            exit 1
+          fi
+          mkdir -p build/ipa/Payload
+          cp -R "$APP" build/ipa/Payload/
+          # Ad-hoc 签名（codesign -s -，无需任何证书/描述文件）。
+          # 侧载工具（Sideloadly/AltStore/爱思助手）之后用自己的证书整体重签。
+          # -depth 保证由内向外：dylib/framework -> appex -> app
+          find build/ipa/Payload -depth \
+            \( -name "*.framework" -o -name "*.appex" -o -name "*.app" \) \
+            -exec codesign -f -s - --generate-entitlement-der {} \;
+          codesign -vv --deep "build/ipa/Payload/sing-box.app" || true
+          cd build/ipa
+          zip -qry "../SFI-${{ inputs.version }}-ios-arm64-unsigned.ipa" Payload
+          cd ..
+          ls -lh *.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SFI-${{ inputs.version }}-ios-arm64-unsigned-ipa
+          path: clients/apple/build/*.ipa
+          if-no-files-found: error
+          compression-level: 0
