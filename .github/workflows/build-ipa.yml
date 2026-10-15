@@ -18,6 +18,11 @@ on:
         description: "sing-box-for-apple 的分支/tag（留空 = 使用子模块锁定的配套 commit）"
         required: false
         default: ""
+      slim:
+        description: "精简模式：删除非必需扩展（保留 VPN 扩展），仅需 2 个 App ID，侧载签名更易成功"
+        required: false
+        default: false
+        type: boolean
       runner:
         description: "GitHub runner 标签（xcode-27 与官方一致；不可用时改 macos-26）"
         required: true
@@ -115,6 +120,19 @@ jobs:
             find build/dd/Build/Products -maxdepth 3 || true
             exit 1
           fi
+          SUFFIX=""
+          if [ "${{ inputs.slim }}" = "true" ]; then
+            echo "==> 精简模式：删除非必需扩展（保留 PlugIns/Extension.appex = VPN 核心）"
+            rm -rf \
+              "$APP/PlugIns/WidgetExtension.appex" \
+              "$APP/PlugIns/ShareExtension.appex" \
+              "$APP/PlugIns/ActionExtension.appex" \
+              "$APP/PlugIns/FileProviderExtension.appex" \
+              "$APP/Extensions/IntentsExtension.appex"
+            echo "剩余扩展："
+            find "$APP" -name "*.appex"
+            SUFFIX="-slim"
+          fi
           mkdir -p build/ipa/Payload
           cp -R "$APP" build/ipa/Payload/
           # Ad-hoc 签名（codesign -s -，无需任何证书/描述文件）。
@@ -125,14 +143,14 @@ jobs:
             -exec codesign -f -s - --generate-entitlement-der {} \;
           codesign -vv --deep "build/ipa/Payload/sing-box.app" || true
           cd build/ipa
-          zip -qry "../SFI-${{ inputs.version }}-ios-arm64-unsigned.ipa" Payload
+          zip -qry "../SFI-${{ inputs.version }}-ios-arm64${SUFFIX}-unsigned.ipa" Payload
           cd ..
           ls -lh *.ipa
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SFI-${{ inputs.version }}-ios-arm64-unsigned-ipa
+          name: SFI-${{ inputs.version }}-ios-arm64${{ inputs.slim && '-slim' || '' }}-unsigned-ipa
           path: clients/apple/build/*.ipa
           if-no-files-found: error
           compression-level: 0
